@@ -1,152 +1,168 @@
-local currentShop, currentData
-local pedSpawned = false
-local listen = false
-local ShopPed = {}
-local NewZones = {}
+local QBCore = exports['qb-core']:GetCoreObject()
+local Bail = {}
 
 -- Functions
 
-local function createBlips()
-    if pedSpawned then return end
-
-    for store in pairs(Config.Locations) do
-        if Config.Locations[store]['showblip'] then
-            local StoreBlip = AddBlipForCoord(Config.Locations[store]['coords']['x'], Config.Locations[store]['coords']['y'], Config.Locations[store]['coords']['z'])
-            SetBlipSprite(StoreBlip, Config.Locations[store]['blipsprite'])
-            SetBlipScale(StoreBlip, Config.Locations[store]['blipscale'])
-            SetBlipDisplay(StoreBlip, 4)
-            SetBlipColour(StoreBlip, Config.Locations[store]['blipcolor'])
-            SetBlipAsShortRange(StoreBlip, true)
-            BeginTextCommandSetBlipName('STRING')
-            AddTextComponentSubstringPlayerName(Config.Locations[store]['label'])
-            EndTextCommandSetBlipName(StoreBlip)
+local function checkTable(valOrList, listOrTable)
+    if type(valOrList) == 'table' and type(listOrTable) == 'table' then
+        for _, v in ipairs(valOrList) do
+            if listOrTable[v] then return true end
         end
+        return false
+    elseif type(valOrList) ~= 'table' and type(listOrTable) == 'table' then
+        for _, v in ipairs(listOrTable) do
+            if v == valOrList then return true end
+        end
+        return false
     end
+
+    return false
 end
 
-local function listenForControl()
-    if listen then return end
-    CreateThread(function()
-        listen = true
-        while listen do
-            if IsControlJustPressed(0, 38) then -- E
-                exports['qb-core']:KeyPressed()
-                TriggerServerEvent('qb-shops:server:openShop', { shop = currentShop })
-                listen = false
-                break
-            end
-            Wait(0)
-        end
-    end)
+local function saveShopInv(shop, products)
+    local shopinv = {}
+    shopinv[shop] = {}
+    shopinv[shop].products = products
+    SaveResourceFile(GetCurrentResourceName(), Config.ShopsInvJsonFile, json.encode(shopinv), -1)
 end
 
-local function createPeds()
-    if pedSpawned then return end
-
-    for k, v in pairs(Config.Locations) do
-        if not v.ped then
-            exports['qb-target']:AddCircleZone(k, vector3(v.coords.x, v.coords.y, v.coords.z), 0.5, {
-                name = k,
-                debugPoly = false,
-                useZ = true
-            }, {
-                options = {
-                    {
-                        label = v.targetLabel,
-                        icon = v.targetIcon,
-                        item = v.item,
-                        type = 'server',
-                        event = 'qb-shops:server:openShop',
-                        shop = k,
-                        job = v.requiredJob,
-                        gang = v.requiredGang
-                    }
-                },
-                distance = 2.0
-            })
-        else
-            local current = type(v['ped']) == 'number' and v['ped'] or joaat(v['ped'])
-            RequestModel(current)
-            while not HasModelLoaded(current) do Wait(0) end
-            ShopPed[k] = CreatePed(0, current, v['coords'].x, v['coords'].y, v['coords'].z - 1, v['coords'].w, false, false)
-            TaskStartScenarioInPlace(ShopPed[k], v['scenario'], 0, true)
-            FreezeEntityPosition(ShopPed[k], true)
-            SetEntityInvincible(ShopPed[k], true)
-            SetBlockingOfNonTemporaryEvents(ShopPed[k], true)
-            if Config.UseTarget then
-                exports['qb-target']:AddTargetEntity(ShopPed[k], {
-                    options = {
-                        {
-                            label = v.targetLabel,
-                            icon = v.targetIcon,
-                            item = v.item,
-                            type = 'server',
-                            event = 'qb-shops:server:openShop',
-                            shop = k,
-                            job = v.requiredJob,
-                            gang = v.requiredGang
-                        }
-                    },
-                    distance = 2.0
-                })
-            end
-        end
-    end
-    pedSpawned = true
-end
-
-local function deletePeds()
-    if not pedSpawned then return end
-    for _, v in pairs(ShopPed) do
-        DeletePed(v)
-    end
-    pedSpawned = false
+local function deliveryPay(source, shop)
+    local Player = QBCore.Functions.GetPlayer(source)
+    if not Player then return end
+    local playerPed = GetPlayerPed(source)
+    local playerCoords = GetEntityCoords(playerPed)
+    local deliverCoords = Config.Locations[shop].delivery
+    local distance = #(playerCoords - vector3(deliverCoords.x, deliverCoords.y, deliverCoords.z))
+    if distance > 10 then return end
+    Player.Functions.AddMoney('bank', Config.DeliveryPrice, 'qb-shops:deliveryPay')
+    if math.random(100) <= 10 then exports['qb-inventory']:AddItem(source, Config.RewardItem, 1, false, false, 'qb-shops:deliveryPay') end
 end
 
 -- Events
 
-RegisterNetEvent('QBCore:Client:OnPlayerLoaded', function()
-    createBlips()
-    createPeds()
+-- Deliveries
+
+RegisterNetEvent('qb-shops:server:RestockShopItems', function(shop)
+    local src = source
+    if not shop then return end
+    if not Config.Locations[shop] then return end
+    deliveryPay(src, shop)
+    if not Config.Locations[shop].useStock then return end
+    local randAmount = math.random(10, 50)
+    for k in pairs(Config.Locations[shop].products) do Config.Locations[shop].products[k].amount += randAmount end
+    saveShopInv(shop, Config.Locations[shop].products)
+    TriggerClientEvent('qb-shops:client:SetShopItems', -1, shop, Config.Locations[shop].products)
 end)
 
-RegisterNetEvent('QBCore:Client:OnPlayerUnload', function()
-    deletePeds()
+RegisterNetEvent('qb-shops:server:UpdateShopItems', function(shop, itemData, amount) -- called from inventory
+    if not shop or not itemData or not amount then return end
+    if not Config.Locations[shop] then return end
+    if not Config.Locations[shop].useStock then return end
+    Config.Locations[shop].products[itemData.slot].amount -= amount
+    if Config.Locations[shop].products[itemData.slot].amount < 0 then
+        Config.Locations[shop].products[itemData.slot].amount = 0
+    end
+    saveShopInv(shop, Config.Locations[shop].products)
+    TriggerClientEvent('qb-shops:client:SetShopItems', -1, shop, Config.Locations[shop].products)
 end)
 
-AddEventHandler('onResourceStart', function(resourceName)
-    if GetCurrentResourceName() ~= resourceName then return end
-    createBlips()
-    createPeds()
+RegisterNetEvent('qb-shops:server:DoBail', function(bool)
+    local src = source
+    local Player = QBCore.Functions.GetPlayer(src)
+    if bool then
+        if Player.Functions.RemoveMoney('cash', Config.TruckDeposit, 'tow-received-bail') then
+            Bail[Player.PlayerData.citizenid] = Config.TruckDeposit
+            TriggerClientEvent('QBCore:Notify', src, Lang:t('success.paid_with_cash', { value = Config.TruckDeposit }), 'success')
+            TriggerClientEvent('qb-shops:client:SpawnVehicle', src)
+        elseif Player.Functions.RemoveMoney('bank', Config.TruckDeposit, 'tow-received-bail') then
+            Bail[Player.PlayerData.citizenid] = Config.TruckDeposit
+            TriggerClientEvent('QBCore:Notify', src, Lang:t('success.paid_with_bank', { value = Config.TruckDeposit }), 'success')
+            TriggerClientEvent('qb-shops:client:SpawnVehicle', src)
+        else
+            TriggerClientEvent('QBCore:Notify', src, Lang:t('error.no_deposit', { value = Config.TruckDeposit }), 'error')
+        end
+    else
+        if Bail[Player.PlayerData.citizenid] then
+            Player.Functions.AddMoney('cash', Bail[Player.PlayerData.citizenid], 'trucker-bail-paid')
+            Bail[Player.PlayerData.citizenid] = nil
+            TriggerClientEvent('QBCore:Notify', src, Lang:t('success.refund_to_cash', { value = Config.TruckDeposit }), 'success')
+        end
+    end
 end)
 
-AddEventHandler('onResourceStop', function(resourceName)
-    if GetCurrentResourceName() ~= resourceName then return end
-    deletePeds()
+RegisterNetEvent('qb-shops:server:PaySlip', function(drops)
+    local src = source
+    local playerPed = GetPlayerPed(src)
+    local playerCoords = GetEntityCoords(playerPed)
+    local coords = Config.DeliveryLocations['main'].coords
+    local distance = #(playerCoords - vector3(coords.x, coords.y, coords.z))
+    if distance > 10 then return end
+    local Player = QBCore.Functions.GetPlayer(src)
+    if not Player then return end
+    local completedDrops = tonumber(drops)
+    if not drops then return end
+    local payment = Config.DeliveryPrice * completedDrops
+    Player.Functions.AddMoney('bank', payment, 'trucker-salary')
+    Player.Functions.AddRep('delivery', completedDrops)
+    TriggerClientEvent('QBCore:Notify', src, Lang:t('success.you_earned', { value = payment }), 'success')
 end)
 
--- Threads
-if not Config.UseTarget then
-    CreateThread(function()
-        for shop in pairs(Config.Locations) do
-            NewZones[#NewZones + 1] = CircleZone:Create(vector3(Config.Locations[shop]['coords']['x'], Config.Locations[shop]['coords']['y'], Config.Locations[shop]['coords']['z']), Config.Locations[shop]['radius'] or 1.5, {
-                useZ = true,
-                debugPoly = false,
-                name = shop,
-            })
+-- Opening shops
+
+RegisterNetEvent('qb-shops:server:openShop', function(data)
+    local src = source
+    local shopName = data.shop
+    local shopData = Config.Locations[shopName]
+    if not shopData then return end
+    local Player = QBCore.Functions.GetPlayer(src)
+    if not Player then return end
+    local playerData = Player.PlayerData
+    local products = shopData.products
+    local items = {}
+
+    if shopData.useStock then
+        local shopInvJson = json.decode(LoadResourceFile(GetCurrentResourceName(), Config.ShopsInvJsonFile))
+        if shopInvJson[shopName] then
+            for k, v in pairs(shopInvJson[shopName].products) do
+                if products[k] then
+                    products[k].amount = v.amount
+                end
+            end
+        end
+    end
+
+    for i = 1, #products do
+        local curProduct = products[i]
+        local addProduct = true
+
+        if curProduct.requiredGrade and playerData.job.grade.level < curProduct.requiredGrade then
+            addProduct = false
         end
 
-        local combo = ComboZone:Create(NewZones, { name = 'RandomZOneName', debugPoly = false })
-        combo:onPlayerInOut(function(isPointInside, _, zone)
-            if isPointInside then
-                currentShop = zone.name
-                currentData = Config.Locations[zone.name]
-                exports['qb-core']:DrawText(Lang:t('info.open_shop'))
-                listenForControl()
-            else
-                exports['qb-core']:HideText()
-                listen = false
-            end
-        end)
-    end)
-end
+        if addProduct and curProduct.requiredJob and not checkTable(playerData.job.name, curProduct.requiredJob) then
+            addProduct = false
+        end
+
+        if addProduct and curProduct.requiredGang and not checkTable(playerData.gang.name, curProduct.requiredGang) then
+            addProduct = false
+        end
+
+        if addProduct and curProduct.requiredLicense and not checkTable(curProduct.requiredLicense, playerData.metadata['licences']) then
+            addProduct = false
+        end
+
+        if addProduct then
+            curProduct.slot = #items + 1
+            items[#items + 1] = curProduct
+        end
+    end
+
+    exports['qb-inventory']:CreateShop({
+        name = shopName,
+        label = shopData.label,
+        slots = shopData.slots,
+        coords = shopData.coords,
+        items = items,
+    })
+    exports['qb-inventory']:OpenShop(src, shopName)
+end)
